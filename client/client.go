@@ -6,13 +6,14 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
+
 	"yunion.io/x/executor/apis"
-	"yunion.io/x/executor/utils"
 )
 
 var exec *Executor
@@ -33,11 +34,31 @@ func Command(path string, args ...string) *Cmd {
 		Executor: exec,
 		Path:     path,
 		Args:     args,
+		wg:       new(sync.WaitGroup),
+		stdoutCh: make(chan struct{}),
+		stderrCh: make(chan struct{}),
+	}
+}
+
+func CommandContext(ctx context.Context, path string, args ...string) *Cmd {
+	if exec == nil {
+		panic("executor not init ???")
+	}
+	return &Cmd{
+		Executor: exec,
+		Path:     path,
+		Args:     args,
+		wg:       new(sync.WaitGroup),
+		stdoutCh: make(chan struct{}),
+		stderrCh: make(chan struct{}),
+		ctx:      ctx,
 	}
 }
 
 type Cmd struct {
 	*Executor
+
+	ctx context.Context
 
 	Path string
 	Args []string
@@ -47,18 +68,27 @@ type Cmd struct {
 	conn   *grpc.ClientConn
 	client apis.ExecutorClient
 
-	fetchError chan error
-	// Proc       *Process
-
-	sn *apis.Sn
-
+	sn     *apis.Sn
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
 
-	closeAfterWait []io.Closer
-	goroutine      []func() error
-	errch          chan error
+	closeAfterWait  []io.Closer
+	closeAfterAfter []io.Closer
+	goroutine       []func() error
+	errch           chan error
+
+	waitDone chan struct{}
+	stdoutCh chan struct{}
+	stderrCh chan struct{}
+
+	fetchError   chan error
+	streamStdin  error
+	streamStdout error
+	streamStderr error
+
+	wg             *sync.WaitGroup
+	combinedOutput chan struct{}
 }
 
 func grcpDialWithUnixSocket(ctx context.Context, socketPath string) (*grpc.ClientConn, error) {
@@ -96,6 +126,7 @@ func (c *Cmd) CombinedOutput() ([]byte, error) {
 	if c.Stderr != nil {
 		return nil, errors.New("exec: Stderr already set")
 	}
+
 	var b bytes.Buffer
 	c.Stdout = &b
 	c.Stderr = &b
@@ -134,39 +165,154 @@ func (c *Cmd) Start() error {
 
 	sn, err := c.client.ExecCommand(context.Background(), &apis.Command{
 		Path: []byte(c.Path),
-		Args: utils.StrArrayToBytesArray(c.Args),
-		Env:  utils.StrArrayToBytesArray(c.Env),
+		Args: strArrayToBytesArray(c.Args),
+		Env:  strArrayToBytesArray(c.Env),
 		Dir:  []byte(c.Dir),
 	})
 	if err != nil {
+		c.closeDescriptors()
 		return errors.Wrap(err, "grcp exec command")
 	}
 	c.sn = sn
 
-	res, err := c.client.Start(context.Background(), c.sn)
+	if c.ctx != nil {
+		select {
+		case <-c.ctx.Done():
+			c.closeDescriptors()
+			return c.ctx.Err()
+		default:
+		}
+	}
+
+	var procIO = [3]*os.File{}
+	type F func(*Cmd) (*os.File, error)
+	for i, setupFd := range [3]F{(*Cmd).stdin, (*Cmd).stdout, (*Cmd).stderr} {
+		if i == 2 && c.Stderr != nil && interfaceEqual(c.Stderr, c.Stdout) {
+			procIO[2] = procIO[1]
+			c.combinedOutput = make(chan struct{}, 2)
+			continue
+		}
+		fd, err := setupFd(c)
+		if err != nil {
+			c.closeDescriptors()
+			return errors.Wrap(err, "setup fd")
+		}
+		procIO[i] = fd
+	}
+
+	input := &apis.StartInput{
+		Sn:        c.sn.Sn,
+		HasStdin:  procIO[0] != nil,
+		HasStdout: procIO[1] != nil,
+		HasStderr: procIO[2] != nil,
+	}
+
+	res, err := c.client.Start(context.Background(), input)
 	if err != nil {
+		c.closeDescriptors()
 		return errors.Wrap(err, "grpc start cmd")
 	}
-	if !res.Success {
-		return errors.New(string(res.Error))
-	} else {
-		if err = c.ioStream(); err != nil {
-			return err
-		}
 
-		return nil
+	if !res.Success {
+		c.closeDescriptors()
+		return errors.New(string(res.Error))
 	}
+
+	if procIO[0] != nil {
+		go c.sendStdin(procIO[0])
+	}
+	if procIO[1] != nil {
+		go c.fetchStdout(procIO[1])
+		<-c.stdoutCh
+	}
+	if procIO[2] != nil {
+		go c.fetchStderr(procIO[2])
+		<-c.stderrCh
+	}
+	if c.combinedOutput != nil {
+		go func(wc io.WriteCloser) {
+			var closed bool
+			for {
+				select {
+				case <-c.combinedOutput:
+					if closed {
+						wc.Close()
+						return
+					} else {
+						closed = true
+					}
+				}
+			}
+		}(procIO[1])
+	}
+
+	c.errch = make(chan error, len(c.goroutine))
+	for _, fn := range c.goroutine {
+		go func(fn func() error) {
+			c.errch <- fn()
+		}(fn)
+	}
+
+	if c.ctx != nil {
+		c.waitDone = make(chan struct{})
+		go func() {
+			select {
+			case <-c.ctx.Done():
+				c.Kill()
+			case <-c.waitDone:
+			}
+		}()
+	}
+
+	return nil
 }
 
-// TODO: 关闭conn连接
+func (c *Cmd) streamError() error {
+	if c.streamStdin != nil {
+		return c.streamStdin
+	}
+	if c.streamStdout != nil {
+		return c.streamStdout
+	}
+	if c.streamStderr != nil {
+		return c.streamStderr
+	}
+	return nil
+}
+
+func (c *Cmd) Kill() error {
+	e, err := c.client.Kill(context.Background(), c.sn)
+	if err != nil {
+		return errors.Wrap(err, "grpc send kill")
+	}
+	if len(e.Error) > 0 {
+		return errors.Errorf("kill process %s", e.Error)
+	}
+	return nil
+}
+
 func (c *Cmd) Wait() error {
 	if c.conn == nil {
 		return errors.New("cmd not executing")
 	}
+
 	res, err := c.client.Wait(context.Background(), c.sn)
 	if err != nil {
+		c.closeDescriptors()
 		return errors.Wrap(err, "grpc wait proc")
 	}
+
+	if c.waitDone != nil {
+		close(c.waitDone)
+	}
+
+	if err := c.streamError(); err != nil {
+		c.closeDescriptors()
+		return err
+	}
+
+	c.wg.Wait()
+
 	if len(res.ErrContent) > 0 {
 		return errors.New(string(res.ErrContent))
 	}
@@ -178,7 +324,7 @@ func (c *Cmd) Wait() error {
 		}
 	}
 
-	c.closeDescriptors(c.closeAfterWait)
+	c.closeDescriptors()
 
 	if res.ExitStatus == 0 {
 		if copyError != nil {
@@ -190,35 +336,16 @@ func (c *Cmd) Wait() error {
 	}
 }
 
-func (c *Cmd) closeDescriptors(closers []io.Closer) {
-	for _, fd := range closers {
+func (c *Cmd) closeDescriptors() {
+	for _, fd := range c.closeAfterWait {
 		fd.Close()
 	}
-}
-
-func (c *Cmd) ioStream() error {
-	var procIO = [3]*os.File{}
-
-	type F func(*Cmd) (*os.File, error)
-	for i, setupFd := range [3]F{(*Cmd).stdin, (*Cmd).stdout, (*Cmd).stderr} {
-		fd, err := setupFd(c)
-		if err != nil {
-			c.closeDescriptors(c.closeAfterWait)
-			return err
-		}
-		procIO[i] = fd
+	for _, fd := range c.closeAfterAfter {
+		fd.Close()
 	}
-	go c.sendStdin(procIO[0])
-	go c.fetchStdout(procIO[1])
-	go c.fetchStderr(procIO[2])
-
-	c.errch = make(chan error, len(c.goroutine))
-	for _, fn := range c.goroutine {
-		go func(fn func() error) {
-			c.errch <- fn()
-		}(fn)
+	if c.conn != nil {
+		c.conn.Close()
 	}
-	return nil
 }
 
 func (c *Cmd) StdinPipe() (io.WriteCloser, error) {
@@ -236,8 +363,8 @@ func (c *Cmd) StdinPipe() (io.WriteCloser, error) {
 	}
 	c.Stdin = pr
 	c.closeAfterWait = append(c.closeAfterWait, pr)
-	wc := &utils.CloseOnce{File: pw}
-	c.closeAfterWait = append(c.closeAfterWait, wc)
+	wc := &CloseOnce{File: pw}
+	c.closeAfterAfter = append(c.closeAfterAfter, wc)
 	return wc, nil
 }
 
@@ -255,7 +382,6 @@ func (c *Cmd) stdin() (*os.File, error) {
 		return nil, err
 	}
 
-	// c.closeAfterStart = append(c.closeAfterStart, pr)
 	c.closeAfterWait = append(c.closeAfterWait, pr)
 	c.goroutine = append(c.goroutine, func() error {
 		_, err := io.Copy(pw, c.Stdin)
@@ -275,14 +401,18 @@ func (c *Cmd) stderr() (f *os.File, err error) {
 	return c.writerDescriptor(c.Stderr)
 }
 
+// interfaceEqual protects against panics from doing equality tests on
+// two interfaces with non-comparable underlying types.
+func interfaceEqual(a, b interface{}) bool {
+	defer func() {
+		recover()
+	}()
+	return a == b
+}
+
 func (c *Cmd) writerDescriptor(w io.Writer) (*os.File, error) {
 	if w == nil {
-		f, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-		if err != nil {
-			return nil, err
-		}
-		c.closeAfterWait = append(c.closeAfterWait, f)
-		return f, nil
+		return nil, nil
 	}
 
 	if f, ok := w.(*os.File); ok {
@@ -316,8 +446,8 @@ func (c *Cmd) StdoutPipe() (io.ReadCloser, error) {
 	}
 	c.Stdout = pw
 	c.closeAfterWait = append(c.closeAfterWait, pw)
-	wc := &utils.CloseOnce{File: pr}
-	c.closeAfterWait = append(c.closeAfterWait, wc)
+	wc := &CloseOnce{File: pr}
+	c.closeAfterAfter = append(c.closeAfterAfter, wc)
 	return wc, nil
 }
 
@@ -334,15 +464,16 @@ func (c *Cmd) StderrPipe() (io.ReadCloser, error) {
 	}
 	c.Stderr = pw
 	c.closeAfterWait = append(c.closeAfterWait, pw)
-	wc := &utils.CloseOnce{File: pr}
-	c.closeAfterWait = append(c.closeAfterWait, wc)
+	wc := &CloseOnce{File: pr}
+	c.closeAfterAfter = append(c.closeAfterAfter, wc)
 	return wc, nil
 }
 
-func (c *Cmd) sendStdin(r io.Reader) error {
+func (c *Cmd) sendStdin(r io.Reader) {
 	stream, err := c.client.SendInput(context.Background())
 	if err != nil {
-		return errors.Wrap(err, "grpc send input")
+		c.streamStdin = errors.Wrap(err, "grpc send input")
+		return
 	}
 
 	var data = make([]byte, 4096)
@@ -351,74 +482,130 @@ func (c *Cmd) sendStdin(r io.Reader) error {
 		if err == io.EOF {
 			e, err := stream.CloseAndRecv()
 			if err != nil {
-				return errors.Wrap(err, "grpc send stdin on close and recv")
+				c.streamStdin = errors.Wrap(err, "grpc send stdin on close and recv")
+				return
 			}
 			if len(e.Error) > 0 {
-				return errors.New(string(e.Error))
+				c.streamStdin = errors.New(string(e.Error))
+				return
 			}
-			return nil
+			return
 		} else if err != nil {
-			return errors.Wrap(err, "read from stdin")
+			c.streamStdin = errors.Wrap(err, "read from stdin")
+			return
 		}
 		err = stream.Send(&apis.Input{
 			Sn:    c.sn.Sn,
 			Input: data[:n],
 		})
 		if err != nil {
-			return err
+			c.streamStdin = errors.Wrap(err, "grpc send stdin")
+			return
 		}
 	}
 }
 
-func (c *Cmd) fetchStdout(w io.WriteCloser) error {
+func (c *Cmd) closeWithCombined() {
+	c.combinedOutput <- struct{}{}
+}
+
+func (c *Cmd) fetchStdout(w io.WriteCloser) {
+	if c.combinedOutput != nil {
+		defer c.closeWithCombined()
+	} else {
+		defer w.Close()
+	}
+
+	c.wg.Add(1)
+	defer c.wg.Done()
 	stream, err := c.client.FetchStdout(context.Background(), c.sn)
 	if err != nil {
-		return errors.Wrap(err, "grpc fetch stdout")
+		close(c.stdoutCh)
+		c.streamStdout = errors.Wrap(err, "grpc fetch stdout")
+		return
 	}
-	defer w.Close()
-	// defer c.stdout.close() 这个样子比较好
+
+	data, err := stream.Recv()
+	close(c.stdoutCh)
+	if err != nil {
+		c.streamStdout = errors.Wrap(err, "stream stdout")
+		return
+	}
+	if !data.Start {
+		c.streamStdout = errors.Wrap(err, "stream stdout not start")
+		return
+	}
+
 	for {
 		data, err := stream.Recv()
 		if err == io.EOF {
-			return nil
+			close(c.stdoutCh)
+			return
 		} else if err != nil {
-			return errors.Wrap(err, "grpc stdout recv")
+			close(c.stdoutCh)
+			c.streamStdout = errors.Wrap(err, "grpc stdout recv")
+			return
 		}
 		if data.Closed {
-			return nil
+			return
 		} else if len(data.RuntimeError) > 0 {
-			return errors.New(string(data.RuntimeError))
+			c.streamStdout = errors.New(string(data.RuntimeError))
+			return
 		} else {
-			err := utils.WriteTo(data.Stdout, w)
+			err := writeTo(data.Stdout, w)
 			if err != nil {
-				return errors.Wrap(err, "write to stdout")
+				c.streamStdout = errors.Wrap(err, "write to stdout")
+				return
 			}
 		}
 	}
 }
 
-func (c *Cmd) fetchStderr(w io.WriteCloser) error {
+func (c *Cmd) fetchStderr(w io.WriteCloser) {
+	if c.combinedOutput != nil {
+		defer c.closeWithCombined()
+	} else {
+		defer w.Close()
+	}
+
+	c.wg.Add(1)
+	defer c.wg.Done()
 	stream, err := c.client.FetchStderr(context.Background(), c.sn)
 	if err != nil {
-		return errors.Wrap(err, "grpc fetch stdout")
+		close(c.stderrCh)
+		c.streamStderr = errors.Wrap(err, "grpc fetch stderr")
+		return
 	}
-	defer w.Close()
-	// defer c.stderr.close() 这个样子比较好
+
+	data, err := stream.Recv()
+	close(c.stderrCh)
+	if err != nil {
+		c.streamStderr = errors.Wrap(err, "stream stderr")
+		return
+	}
+	if !data.Start {
+		c.streamStderr = errors.Wrap(err, "stream stderr not start")
+		return
+	}
+
 	for {
 		data, err := stream.Recv()
 		if err == io.EOF {
-			return nil
+			return
 		} else if err != nil {
-			return errors.Wrap(err, "grpc stderr recv")
+			c.streamStderr = errors.Wrap(err, "grpc stderr recv")
+			return
 		}
 		if data.Closed {
-			return nil
+			return
 		} else if len(data.RuntimeError) > 0 {
-			return errors.New(string(data.RuntimeError))
+			c.streamStderr = errors.New(string(data.RuntimeError))
+			return
 		} else {
-			err := utils.WriteTo(data.Stderr, w)
+			err := writeTo(data.Stderr, w)
 			if err != nil {
-				return errors.Wrap(err, "write to stderr")
+				c.streamStderr = errors.Wrap(err, "write to stderr")
+				return
 			}
 		}
 	}
@@ -486,14 +673,42 @@ func (e *ExitError) Error() string {
 	return exitStatusToString(e.ExitStatus)
 }
 
-type BufCloser struct {
-	*bytes.Buffer
+func strArrayToBytesArray(sa []string) [][]byte {
+	if len(sa) == 0 {
+		return nil
+	}
+	res := make([][]byte, len(sa))
+	for i := 0; i < len(sa); i++ {
+		res[i] = []byte(sa[i])
+	}
+	return res
 }
 
-func NewBufCloser(buf *bytes.Buffer) *BufCloser {
-	return &BufCloser{buf}
-}
-
-func (bc *BufCloser) Close() error {
+func writeTo(data []byte, w io.Writer) error {
+	var n = 0
+	var length = len(data)
+	for n < length {
+		r, e := w.Write(data[n:])
+		if e != nil {
+			return e
+		}
+		n += r
+	}
 	return nil
+}
+
+type CloseOnce struct {
+	*os.File
+
+	once sync.Once
+	err  error
+}
+
+func (c *CloseOnce) Close() error {
+	c.once.Do(c.close)
+	return c.err
+}
+
+func (c *CloseOnce) close() {
+	c.err = c.File.Close()
 }

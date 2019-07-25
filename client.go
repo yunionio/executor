@@ -6,11 +6,9 @@ import (
 	"io"
 	"os"
 	"strings"
-	"syscall"
+	"time"
 
 	"yunion.io/x/executor/client"
-	"yunion.io/x/log"
-	"yunion.io/x/pkg/util/signalutils"
 	"yunion.io/x/pkg/utils"
 )
 
@@ -20,49 +18,62 @@ func Client() {
 	}
 	client.Init(socketPath)
 
-	signalutils.RegisterSignal(func() {
-		utils.DumpAllGoroutineStack(log.Logger().Out)
-	}, syscall.SIGUSR1)
-	signalutils.StartTrap()
+	start()
+}
 
-	// testPipeLine()
+func start() {
 	fmt.Print("# ")
 	reader := bufio.NewReader(os.Stdin)
 	var cmdRunning bool
-	var pr *io.PipeReader
-	var pw *io.PipeWriter
+	var Sinput io.Writer
 	for {
 		content, _ := reader.ReadString('\n')
 		if cmdRunning {
-			io.WriteString(pw, content)
+			io.WriteString(Sinput, content)
 			continue
 		}
 		input := strings.TrimSpace(strings.Trim(content, "\n"))
 		if utils.IsInStringArray(input, []string{"exit", "quit"}) {
 			return
 		} else if input == "" {
+			fmt.Println(time.Now().UTC().String())
 			fmt.Print("# ")
 			continue
 		}
-		// inputCmd := utils.ArgsStringToArray(input)
-		pr, pw = io.Pipe()
-		// ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		c := client.Command("sh", "-c", input)
-		c.Stdin = pr
-		c.Stdout = os.Stdout
-		c.Stderr = os.Stderr
+		is := utils.ArgsStringToArray(input)
+		c := client.Command(is[0], is[1:]...)
+		si, err := c.StdinPipe()
+		if err != nil {
+			panic(err)
+		}
+		Sinput = si
+		stdout, err := c.StdoutPipe()
+		if err != nil {
+			panic(err)
+		}
+		stderr, err := c.StderrPipe()
+		if err != nil {
+			panic(err)
+		}
 
 		if err := c.Start(); err != nil {
 			fmt.Printf("cmd %s start failed: %s\n", input, err)
+			fmt.Print("# ")
 			continue
 		}
+
+		go func() {
+			io.Copy(os.Stdout, stdout)
+		}()
+		go func() {
+			io.Copy(os.Stderr, stderr)
+		}()
+
 		cmdRunning = true
 		go func() {
 			if err := c.Wait(); err != nil {
 				fmt.Printf("cmd %s wait failed: %s\n", input, err)
 			}
-			// cancel()
-			pr.Close()
 			cmdRunning = false
 			fmt.Print("# ")
 		}()

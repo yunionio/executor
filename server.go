@@ -4,12 +4,9 @@ import (
 	"net"
 	"os"
 	"strings"
-	"syscall"
 
 	"google.golang.org/grpc"
 	"yunion.io/x/log"
-	"yunion.io/x/pkg/util/signalutils"
-	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/executor/apis"
 	"yunion.io/x/executor/server"
@@ -57,7 +54,10 @@ func (s *SExecuteService) runService() {
 	}
 	defer listener.Close()
 	log.Infof("Init net listener on %s succ", socketPath)
-	grpcServer.Serve(listener)
+	err = grpcServer.Serve(listener)
+	if err != nil {
+		log.Fatalln(err)
+	}
 }
 
 func (s *SExecuteService) initService() {
@@ -67,11 +67,6 @@ func (s *SExecuteService) initService() {
 	if err := s.prepareEnv(); err != nil {
 		log.Fatalln(err)
 	}
-
-	signalutils.RegisterSignal(func() {
-		utils.DumpAllGoroutineStack(log.Logger().Out)
-	}, syscall.SIGUSR1)
-	signalutils.StartTrap()
 }
 
 func (s *SExecuteService) Run() {
@@ -80,6 +75,5 @@ func (s *SExecuteService) Run() {
 }
 
 func Server() {
-	server.Init(socketPath)
 	NewExecuteService().Run()
 }
