@@ -1,6 +1,17 @@
 export GO111MODULE:=on
-all:
-	go build -mod vendor -o exec
+
+ROOT_DIR := $(CURDIR)
+BUILD_DIR := $(ROOT_DIR)/_output
+BIN_DIR := $(BUILD_DIR)/bin
+BUILD_SCRIPT := $(ROOT_DIR)/build/build.sh
+
+executor:
+	go build -mod vendor -o $(BIN_DIR)/executor
+
+rpm: executor
+	$(BUILD_SCRIPT) executor
+
+all: executor
 
 clean:
-	rm -f exec
+	rm -rf $(BIN_DIR)
