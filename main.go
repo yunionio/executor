@@ -2,6 +2,8 @@ package main
 
 import (
 	"flag"
+	"os"
+	"path/filepath"
 	"syscall"
 
 	"yunion.io/x/log"
@@ -16,6 +18,16 @@ func init() {
 	flag.BoolVar(&isServer, "is-server", false, "execute server")
 	flag.StringVar(&socketPath, "socket-path", "/var/run/exec.sock", "execute service listen socket path")
 	flag.Parse()
+
+	var err error
+	socketPath, err = filepath.Abs(socketPath)
+	if err != nil {
+		log.Fatalf("failed parse socket path: %s", socketPath)
+	}
+	err = os.MkdirAll(filepath.Dir(socketPath), 0755)
+	if err != nil {
+		log.Fatalf("failed mkdir socket path: %s", err)
+	}
 
 	signalutils.RegisterSignal(func() {
 		log.Errorln("ALL GO ROUTINE STACK")
