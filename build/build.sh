@@ -51,6 +51,8 @@ RELEASE=`date +"%y%m%d%H"`
 SPEC_DIR=$BUILDROOT/SPECS
 SPEC_FILE=$SPEC_DIR/${PKG}.spec
 RPM_DIR=$BUILDROOT/RPMS
+SERVICE_NAME=yunion-$PKG-server
+PKG_NAME=yunion-$PKG
 
 if [ -z "$OWNER" ]; then
 	OWNER=yunion
@@ -65,14 +67,14 @@ mkdir -p $SPEC_DIR
 echo "# Yunion RPM spec
 
 %global owner   $OWNER
-%global pkgname yunion-$PKG
+%global pkgname $PKG_NAME
 %global homedir /var/run/%{owner}
 %global use_systemd $SERVICE
 
-Name: %{pkgname}
+Name: $SERVICE_NAME
 Version: $VERSION
 Release: $RELEASE
-Summary: %{pkgname}
+Summary: $SERVICE_NAME
 
 Group: Unspecified
 License: GPL
@@ -109,7 +111,8 @@ getent passwd %{owner} >/dev/null || /usr/sbin/useradd -r -s /sbin/nologin -d %{
 %if %{use_systemd}
     mkdir -p /var/run/%{owner}
     chown -R %{owner}:%{owner} /var/run/%{owner}
-    /usr/bin/systemctl preset %{pkgname}.service >/dev/null 2>&1 ||:
+    /usr/bin/systemctl preset %{pkgname}.service >/dev/null 2>&1
+    /usr/bin/systemctl restart %{pkgname}.service >/dev/null 2>&1 ||:
 %endif
 
 %preun
