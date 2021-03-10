@@ -42,7 +42,7 @@ if [ -z "$VERSION" ]; then
 fi
 RELEASE=`date +"%y%m%d%H"`
 FULL_VERSION=$VERSION-$RELEASE
-BUILDROOT=$OUTPUT_DIR/yunion-executor-server-$FULL_VERSION
+BUILDROOT=$OUTPUT_DIR/yunion-executor-$FULL_VERSION
 rm -rf $BUILDROOT
 mkdir -p $BUILDROOT/DEBIAN
 mkdir -p $BUILDROOT/$BIN_PATH
@@ -62,7 +62,7 @@ case $(uname -m) in
         ;;
 esac
 
-echo "Package: yunion-executor-server
+echo "Package: yunion-executor
 Version: $FULL_VERSION
 Section: base
 Priority: optional
