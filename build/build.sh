@@ -51,7 +51,7 @@ RELEASE=`date +"%y%m%d%H"`
 SPEC_DIR=$BUILDROOT/SPECS
 SPEC_FILE=$SPEC_DIR/${PKG}.spec
 RPM_DIR=$BUILDROOT/RPMS
-SERVICE_NAME=yunion-$PKG-server
+SERVICE_NAME=yunion-$PKG
 PKG_NAME=yunion-$PKG
 
 if [ -z "$OWNER" ]; then
