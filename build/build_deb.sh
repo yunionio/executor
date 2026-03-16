@@ -60,6 +60,8 @@ case $(uname -m) in
     aarch64)
         CURRENT_ARCH=arm64
         ;;
+    riscv64)
+        CURRENT_ARCH=riscv64
 esac
 
 echo "Package: yunion-executor
